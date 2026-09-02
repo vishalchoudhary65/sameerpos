@@ -1,13 +1,10 @@
 import sqlite3
-
-DB_FILE = "shop.db"
+from config import DB_FILE
 
 def init_db():
-    """Initializes tables for repairs and customer ledger."""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-
-    # Repairs Table (autoincrement starts at 1001 for clean job tokens)
+    # 1. Repairs Table
     c.execute("""
         CREATE TABLE IF NOT EXISTS repairs (
             job_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -24,8 +21,7 @@ def init_db():
             profit REAL
         )
     """)
-
-    # Ledger Table (Udhar / Jama Tracking)
+    # 2. Ledger / Khata Table
     c.execute("""
         CREATE TABLE IF NOT EXISTS ledger (
             entry_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -36,8 +32,18 @@ def init_db():
             note TEXT
         )
     """)
-
-    # Ensure Job IDs start at 1001 if the table is fresh
+    # 3. Inventory / Stock Table
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS inventory (
+            item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE,
+            category TEXT,
+            qty INTEGER DEFAULT 0,
+            cost_price REAL DEFAULT 0.0,
+            selling_price REAL DEFAULT 0.0
+        )
+    """)
+    # Set starting Job ID to 1001
     c.execute("SELECT count(*) FROM repairs")
     if c.fetchone()[0] == 0:
         c.execute("INSERT INTO sqlite_sequence (name, seq) VALUES ('repairs', 1000)")
@@ -45,7 +51,7 @@ def init_db():
     conn.commit()
     conn.close()
 
-# ================= REPAIR OPERATIONS =================
+# --- REPAIRS ---
 def db_add_repair(data):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -64,28 +70,21 @@ def db_add_repair(data):
     return {"status": "success", "job_id": job_id, "profit": profit}
 
 def db_find_job(job_id):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT job_id, date, name, model, fault, cost, charged, imei, lock_code, status, profit FROM repairs WHERE job_id = ?", (int(job_id),))
-    row = c.fetchone()
-    conn.close()
-    if not row:
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT job_id, date, name, model, fault, cost, charged, imei, lock_code, status, profit FROM repairs WHERE job_id = ?", (int(job_id),))
+        row = c.fetchone()
+        conn.close()
+        if not row:
+            return {"status": "not_found"}
+        return {
+            "status": "success", "job_id": row[0], "date": row[1], "name": row[2],
+            "customer": row[2], "model": row[3], "fault": row[4], "cost": row[5],
+            "charged": row[6], "imei": row[7], "lock_code": row[8], "job_status": row[9], "profit": row[10]
+        }
+    except Exception:
         return {"status": "not_found"}
-    return {
-        "status": "success",
-        "job_id": row[0],
-        "date": row[1],
-        "name": row[2],
-        "customer": row[2],
-        "model": row[3],
-        "fault": row[4],
-        "cost": row[5],
-        "charged": row[6],
-        "imei": row[7],
-        "lock_code": row[8],
-        "job_status": row[9],
-        "profit": row[10]
-    }
 
 def db_update_status(job_id, new_status):
     conn = sqlite3.connect(DB_FILE)
@@ -93,7 +92,6 @@ def db_update_status(job_id, new_status):
     c.execute("UPDATE repairs SET status = ? WHERE job_id = ?", (new_status, int(job_id)))
     conn.commit()
     conn.close()
-    return {"status": "success"}
 
 def db_get_today_jobs(date_str):
     conn = sqlite3.connect(DB_FILE)
@@ -101,19 +99,7 @@ def db_get_today_jobs(date_str):
     c.execute("SELECT job_id, name, model, fault, cost, charged, profit FROM repairs WHERE date = ?", (date_str,))
     rows = c.fetchall()
     conn.close()
-
-    jobs = []
-    for r in rows:
-        jobs.append({
-            "job_id": r[0],
-            "customer": r[1],
-            "model": r[2],
-            "fault": r[3],
-            "cost": r[4],
-            "charged": r[5],
-            "auto_profit": r[6]
-        })
-    return {"status": "success", "jobs": jobs}
+    return [{"job_id": r[0], "customer": r[1], "model": r[2], "fault": r[3], "cost": r[4], "charged": r[5], "auto_profit": r[6]} for r in rows]
 
 def db_update_profit(job_id, profit):
     conn = sqlite3.connect(DB_FILE)
@@ -121,50 +107,57 @@ def db_update_profit(job_id, profit):
     c.execute("UPDATE repairs SET profit = ? WHERE job_id = ?", (float(profit), int(job_id)))
     conn.commit()
     conn.close()
-    return {"status": "success"}
 
-# ================= LEDGER OPERATIONS =================
+# --- LEDGER ---
 def db_add_ledger(date_str, name, entry_type, amount, note):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("""
-        INSERT INTO ledger (date, name, entry_type, amount, note)
-        VALUES (?, ?, ?, ?, ?)
-    """, (date_str, name.strip(), entry_type, float(amount), note))
+    c.execute("INSERT INTO ledger (date, name, entry_type, amount, note) VALUES (?, ?, ?, ?, ?)",
+              (date_str, name.strip(), entry_type, float(amount), note))
     entry_id = c.lastrowid
     conn.commit()
     conn.close()
-    return {"status": "success", "entry_id": entry_id}
+    return entry_id
 
 def db_get_customer_balance(name):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("""
-        SELECT date, entry_type, amount, note 
-        FROM ledger 
-        WHERE LOWER(name) = LOWER(?)
-        ORDER BY entry_id ASC
-    """, (name.strip(),))
+    c.execute("SELECT date, entry_type, amount, note FROM ledger WHERE LOWER(name) = LOWER(?) ORDER BY entry_id ASC", (name.strip(),))
     rows = c.fetchall()
     conn.close()
 
-    total_debit = 0.0
-    total_credit = 0.0
+    total_debit, total_credit = 0.0, 0.0
     history = []
-
     for r in rows:
-        e_type, amt = r[1], float(r[2])
-        if e_type == "Debit":
-            total_debit += amt
-        elif e_type == "Credit":
-            total_credit += amt
-        history.append({"date": r[0], "type": e_type, "amount": amt, "note": r[3]})
+        amt = float(r[2])
+        if r[1] == "Debit": total_debit += amt
+        elif r[1] == "Credit": total_credit += amt
+        history.append({"date": r[0], "type": r[1], "amount": amt, "note": r[3]})
 
     return {
-        "status": "success",
-        "customer": name,
-        "total_debit": total_debit,
-        "total_credit": total_credit,
-        "balance": total_debit - total_credit,
-        "history": history[-5:]
+        "customer": name, "total_debit": total_debit, "total_credit": total_credit,
+        "balance": total_debit - total_credit, "history": history[-5:]
     }
+
+# --- INVENTORY ---
+def db_add_stock(name, category, qty, cost, sell):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO inventory (name, category, qty, cost_price, selling_price)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(name) DO UPDATE SET
+            qty = qty + excluded.qty,
+            cost_price = excluded.cost_price,
+            selling_price = excluded.selling_price
+    """, (name.strip(), category.strip(), int(qty), float(cost), float(sell)))
+    conn.commit()
+    conn.close()
+
+def db_get_all_stock():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT name, category, qty, cost_price, selling_price FROM inventory ORDER BY qty ASC")
+    rows = c.fetchall()
+    conn.close()
+    return rows
