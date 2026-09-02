@@ -1,8 +1,23 @@
 import sqlite3
 import csv
 import datetime
-from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ConversationHandler, CallbackQueryHandler, ContextTypes, filters
+from telegram import (
+    Update,
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ConversationHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
 import warnings
 from telegram.warnings import PTBUserWarning
 
@@ -10,12 +25,46 @@ warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 from config import BOT_TOKEN, ADMIN_CHAT_ID, MAIN_MENU_KEYBOARD, TIMEZONE, IMAGE_DIR, DB_FILE
 from database import (
-    init_db, db_add_repair, db_find_job, db_update_status, db_get_today_jobs,
-    db_update_profit, db_add_ledger, db_get_customer_balance, db_add_stock, db_get_all_stock
+    init_db,
+    db_add_repair,
+    db_find_job,
+    db_update_status,
+    db_get_today_jobs,
+    db_update_profit,
+    db_add_ledger,
+    db_get_customer_balance,
 )
 from printer import print_repair_token, print_eod_report
+from modules.inventory import (
+    inventory_main_menu,
+    start_add_category,
+    save_category_name,
+    category_detail_menu,
+    list_items_in_category,
+    handle_qty_change,
+    handle_item_delete,
+    start_add_item,
+    get_item_name,
+    get_item_qty,
+    get_item_cost,
+    get_item_sell,
+    get_item_warranty,
+    start_item_edit,
+    select_edit_field,
+    save_edit_val,
+    send_8am_restock_alert,
+    cancel_inv,
+    ADD_CAT_NAME,
+    ITEM_NAME,
+    ITEM_QTY,
+    ITEM_COST,
+    ITEM_SELL,
+    ITEM_WARRANTY,
+    EDIT_SELECT_FIELD,
+    EDIT_NEW_VAL,
+)
 
-# Security decorator
+# ================= SECURITY DECORATOR =================
 def admin_only(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         if update.effective_user.id != ADMIN_CHAT_ID:
@@ -24,14 +73,14 @@ def admin_only(func):
         return await func(update, context, *args, **kwargs)
     return wrapper
 
-# --- State Definitions ---
+# ================= CONVERSATION STATES =================
 NAME, MODEL, FAULT, REPAIR_DATE, COST_PRICE, CHARGED_PRICE, LOCK_CODE, IMEI, PHOTO = range(9)
 EOD_PROFIT_INPUT = 1
 LEDGER_NAME, LEDGER_AMOUNT, LEDGER_NOTE = range(9, 12)
 PAYMENT_NAME, PAYMENT_AMOUNT, PAYMENT_NOTE = range(12, 15)
 KHATA_SEARCH = 15
 
-# --- Menu & Fallbacks ---
+# ================= MENU & NAVIGATION =================
 @admin_only
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_markdown("🛠 *SAMEER MOBILE - Control Panel*", reply_markup=MAIN_MENU_KEYBOARD)
@@ -40,7 +89,14 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Cancelled.", reply_markup=MAIN_MENU_KEYBOARD)
     return ConversationHandler.END
 
-# --- REPAIRS MODULE ---
+async def handle_menu_shortcuts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text == "📊 Check Status":
+        await update.message.reply_text("Send: `/status [JobID]` (e.g., `/status 1001`)", parse_mode="Markdown")
+    elif text == "🖨️ Reprint Token":
+        await update.message.reply_text("Send: `/reprint [JobID]` (e.g., `/reprint 1001`)", parse_mode="Markdown")
+
+# ================= REPAIRS MODULE =================
 @admin_only
 async def start_new_repair(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
@@ -59,7 +115,11 @@ async def get_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def get_fault(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["fault"] = update.message.text.strip()
-    await update.message.reply_text("Enter *Date* (YYYY-MM-DD) or tap *Today*:", reply_markup=ReplyKeyboardMarkup([["Today"]], one_time_keyboard=True, resize_keyboard=True), parse_mode="Markdown")
+    await update.message.reply_text(
+        "Enter *Date* (YYYY-MM-DD) or tap *Today*:",
+        reply_markup=ReplyKeyboardMarkup([["Today"]], one_time_keyboard=True, resize_keyboard=True),
+        parse_mode="Markdown",
+    )
     return REPAIR_DATE
 
 async def get_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -69,7 +129,8 @@ async def get_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return COST_PRICE
 
 async def get_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try: context.user_data["cost"] = float(update.message.text.strip())
+    try:
+        context.user_data["cost"] = float(update.message.text.strip())
     except ValueError:
         await update.message.reply_text("⚠️ Enter a valid number:")
         return COST_PRICE
@@ -77,23 +138,36 @@ async def get_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return CHARGED_PRICE
 
 async def get_charged(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try: context.user_data["charged"] = float(update.message.text.strip())
+    try:
+        context.user_data["charged"] = float(update.message.text.strip())
     except ValueError:
         await update.message.reply_text("⚠️ Enter a valid number:")
         return CHARGED_PRICE
-    await update.message.reply_text("Enter *PIN / Pattern Lock* (or tap Skip):", reply_markup=ReplyKeyboardMarkup([["No Lock / Skip"]], one_time_keyboard=True, resize_keyboard=True), parse_mode="Markdown")
+    await update.message.reply_text(
+        "Enter *PIN / Pattern Lock* (or tap Skip):",
+        reply_markup=ReplyKeyboardMarkup([["No Lock / Skip"]], one_time_keyboard=True, resize_keyboard=True),
+        parse_mode="Markdown",
+    )
     return LOCK_CODE
 
 async def get_lock_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     inp = update.message.text.strip()
     context.user_data["lock_code"] = "None" if "skip" in inp.lower() or "no lock" in inp.lower() else inp
-    await update.message.reply_text("Enter *IMEI* (or tap Skip):", reply_markup=ReplyKeyboardMarkup([["Skip IMEI"]], one_time_keyboard=True, resize_keyboard=True), parse_mode="Markdown")
+    await update.message.reply_text(
+        "Enter *IMEI* (or tap Skip):",
+        reply_markup=ReplyKeyboardMarkup([["Skip IMEI"]], one_time_keyboard=True, resize_keyboard=True),
+        parse_mode="Markdown",
+    )
     return IMEI
 
 async def get_imei(update: Update, context: ContextTypes.DEFAULT_TYPE):
     inp = update.message.text.strip()
     context.user_data["imei"] = "N/A" if inp.lower() == "skip imei" else inp
-    await update.message.reply_text("Send *Condition Photo* (or tap Skip):", reply_markup=ReplyKeyboardMarkup([["Skip Image"]], one_time_keyboard=True, resize_keyboard=True), parse_mode="Markdown")
+    await update.message.reply_text(
+        "Send *Condition Photo* (or tap Skip):",
+        reply_markup=ReplyKeyboardMarkup([["Skip Image"]], one_time_keyboard=True, resize_keyboard=True),
+        parse_mode="Markdown",
+    )
     return PHOTO
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -120,7 +194,41 @@ async def save_repair(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_markdown(summary, reply_markup=MAIN_MENU_KEYBOARD)
     return ConversationHandler.END
 
-# --- LEDGER MODULE ---
+# ================= STATUS UPDATE =================
+@admin_only
+async def check_or_update_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: `/status 1001`", parse_mode="Markdown")
+        return
+    job_id = context.args[0].strip()
+    res = db_find_job(job_id)
+    if res.get("status") != "success":
+        await update.message.reply_text(f"❌ Job `#{job_id}` not found.")
+        return
+
+    keyboard = [
+        [
+            InlineKeyboardButton("⏳ In Progress", callback_data=f"st_{job_id}_In Progress"),
+            InlineKeyboardButton("✅ Completed", callback_data=f"st_{job_id}_Completed"),
+        ],
+        [
+            InlineKeyboardButton("📦 Delivered", callback_data=f"st_{job_id}_Delivered"),
+            InlineKeyboardButton("❌ Returned", callback_data=f"st_{job_id}_Returned"),
+        ],
+    ]
+    await update.message.reply_markdown(
+        f"📱 *Job #{job_id}* ({res['model']})\n👤 Customer: {res['name']}\n🔐 Lock: `{res.get('lock_code', 'None')}`\nStatus: `{res['job_status']}`\nSelect new status:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+async def handle_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, job_id, new_status = query.data.split("_", 2)
+    db_update_status(job_id, new_status)
+    await query.edit_message_text(f"✅ Job `#{job_id}` updated to *{new_status}*.", parse_mode="Markdown")
+
+# ================= LEDGER MODULE =================
 @admin_only
 async def start_udhar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
@@ -133,7 +241,8 @@ async def get_udhar_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return LEDGER_AMOUNT
 
 async def get_udhar_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try: context.user_data["l_amount"] = float(update.message.text.strip())
+    try:
+        context.user_data["l_amount"] = float(update.message.text.strip())
     except ValueError:
         await update.message.reply_text("⚠️ Enter valid amount:")
         return LEDGER_AMOUNT
@@ -160,7 +269,8 @@ async def get_payment_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return PAYMENT_AMOUNT
 
 async def get_payment_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try: context.user_data["p_amount"] = float(update.message.text.strip())
+    try:
+        context.user_data["p_amount"] = float(update.message.text.strip())
     except ValueError:
         await update.message.reply_text("⚠️ Enter valid amount:")
         return PAYMENT_AMOUNT
@@ -190,34 +300,12 @@ async def perform_khata_lookup(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_markdown(msg, reply_markup=MAIN_MENU_KEYBOARD)
     return ConversationHandler.END
 
-# --- INVENTORY MODULE ---
-@admin_only
-async def show_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    items = db_get_all_stock()
-    if not items:
-        await update.message.reply_text("📦 Inventory is empty. Add stock using `/addstock [Name] [Qty] [Cost] [Sell] [Category]`", reply_markup=MAIN_MENU_KEYBOARD)
-        return
-    lines = []
-    for it in items:
-        status = "⚠️ LOW" if it[2] <= 2 else "✅"
-        lines.append(f"{status} *{it[0]}* ({it[1]}): {it[2]} pcs | Sell: ₹{it[4]:.0f}")
-    await update.message.reply_markdown("📦 *CURRENT STOCK LIST*\n━━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines), reply_markup=MAIN_MENU_KEYBOARD)
-
-@admin_only
-async def add_stock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # /addstock Combo_M12 5 800 1300 Display
-    if len(context.args) < 5:
-        await update.message.reply_text("Usage: `/addstock [Name] [Qty] [Cost] [Sell] [Category]`\nExample: `/addstock Combo_M12 5 850 1400 Screen`", parse_mode="Markdown")
-        return
-    name, qty, cost, sell, cat = context.args[0], int(context.args[1]), float(context.args[2]), float(context.args[3]), context.args[4]
-    db_add_stock(name, cat, qty, cost, sell)
-    await update.message.reply_markdown(f"✅ Added *{qty}* units of *{name}* to inventory.")
-
-# --- EOD MODULE ---
+# ================= EOD CLOSING MODULE =================
 @admin_only
 async def start_eod_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target = update.callback_query.message if update.callback_query else update.message
-    if update.callback_query: await update.callback_query.answer()
+    if update.callback_query:
+        await update.callback_query.answer()
     today_str = datetime.date.today().strftime("%Y-%m-%d")
     jobs = db_get_today_jobs(today_str)
     if not jobs:
@@ -236,7 +324,7 @@ async def prompt_next_eod(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await target.reply_text(
         f"📱 *Job {idx + 1}/{len(jobs)}* — `Token #{j['job_id']}`\n👤 {j['customer']} | {j['model']} ({j['fault']})\n💸 Cost: ₹{j['cost']:.0f} | Charged: ₹{j['charged']:.0f}\nEst. Profit: ₹{j['auto_profit']:.0f}\n\nEnter actual profit:",
         reply_markup=ReplyKeyboardMarkup([[f"Keep ₹{j['auto_profit']:.0f}"]], one_time_keyboard=True, resize_keyboard=True),
-        parse_mode="Markdown"
+        parse_mode="Markdown",
     )
     return EOD_PROFIT_INPUT
 
@@ -262,15 +350,25 @@ async def handle_profit_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     summary = "\n".join([f"• `#{x['job_id']}` {x['model']} ➔ ₹{x['final_profit']:,.2f}" for x in records])
     await update.message.reply_markdown(
         f"🏁 *EOD Completed ({d_str})*\n\n{summary}\n━━━━━━━━━━━━━━━━━━━\n📱 Jobs: {len(records)} | 💰 Revenue: ₹{tot_charged:,.2f}\n📈 Net Profit: ₹{tot_profit:,.2f}\n🖨️ *Receipt Printed to Bench!*",
-        reply_markup=MAIN_MENU_KEYBOARD
+        reply_markup=MAIN_MENU_KEYBOARD,
     )
     return ConversationHandler.END
 
-# --- EXPORT & REPRINT ---
+# ================= 9:00 PM REMINDER =================
+async def send_9pm_reminder(context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [[InlineKeyboardButton("🏁 Start End of Day Review", callback_data="start_eod")]]
+    await context.bot.send_message(
+        chat_id=ADMIN_CHAT_ID,
+        text="🔔 *9:00 PM Closing Reminder*\nReady to review profits and print closing receipt?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+# ================= EXPORT & REPRINT =================
 @admin_only
 async def reprint_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: `/reprint 1001`")
+        await update.message.reply_text("Usage: `/reprint 1001`", parse_mode="Markdown")
         return
     res = db_find_job(context.args[0].strip())
     if res.get("status") != "success":
@@ -293,7 +391,7 @@ async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with open("repairs_backup.csv", "rb") as f:
         await update.message.reply_document(document=f, filename="repairs_backup.csv", caption="📊 Database CSV Export")
 
-# --- INITIALIZATION ---
+# ================= SET BOT COMMANDS =================
 async def post_init(application):
     await application.bot.set_my_commands([
         BotCommand("start", "Open Main Menu"),
@@ -301,28 +399,32 @@ async def post_init(application):
         BotCommand("udhar", "Log customer due amount"),
         BotCommand("payment", "Log payment received"),
         BotCommand("khata", "Check customer balance"),
-        BotCommand("stock", "View current shelf inventory"),
-        BotCommand("addstock", "Add stock units"),
         BotCommand("eod", "Start End of Day review"),
+        BotCommand("status", "Check/Update job status"),
         BotCommand("reprint", "Reprint thermal receipt"),
         BotCommand("export", "Export database CSV backup"),
     ])
 
+# ================= MAIN EXECUTION =================
 def main():
     init_db()
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
+    # Core Navigation & Buttons
     app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("stock", show_stock))
-    app.add_handler(CommandHandler("addstock", add_stock_cmd))
     app.add_handler(CommandHandler("reprint", reprint_token))
+    app.add_handler(CommandHandler("status", check_or_update_status))
     app.add_handler(CommandHandler("export", export_data))
-    app.add_handler(MessageHandler(filters.Regex("^📦 Stock / Inventory$"), show_stock))
+    app.add_handler(CallbackQueryHandler(handle_status_callback, pattern="^st_"))
     app.add_handler(MessageHandler(filters.Regex("^📥 Export Backup$"), export_data))
+    app.add_handler(MessageHandler(filters.Regex("^(📊 Check Status|🖨️ Reprint Token)$"), handle_menu_shortcuts))
 
-    # Handlers
+    # Repair Flow
     app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("newrepair", start_new_repair), MessageHandler(filters.Regex("^➕ New Repair$"), start_new_repair)],
+        entry_points=[
+            CommandHandler("newrepair", start_new_repair),
+            MessageHandler(filters.Regex("^➕ New Repair$"), start_new_repair),
+        ],
         states={
             NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_name)],
             MODEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_model)],
@@ -332,13 +434,20 @@ def main():
             CHARGED_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_charged)],
             LOCK_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_lock_code)],
             IMEI: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_imei)],
-            PHOTO: [MessageHandler(filters.PHOTO, handle_photo), MessageHandler(filters.TEXT & ~filters.COMMAND, skip_photo)],
+            PHOTO: [
+                MessageHandler(filters.PHOTO, handle_photo),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, skip_photo),
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     ))
 
+    # Udhar Flow
     app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("udhar", start_udhar), MessageHandler(filters.Regex("^📒 Udhar / Due$"), start_udhar)],
+        entry_points=[
+            CommandHandler("udhar", start_udhar),
+            MessageHandler(filters.Regex("^📒 Udhar / Due$"), start_udhar),
+        ],
         states={
             LEDGER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_udhar_name)],
             LEDGER_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_udhar_amount)],
@@ -347,8 +456,12 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     ))
 
+    # Payment Flow
     app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("payment", start_payment), MessageHandler(filters.Regex("^💵 Receive Payment$"), start_payment)],
+        entry_points=[
+            CommandHandler("payment", start_payment),
+            MessageHandler(filters.Regex("^💵 Receive Payment$"), start_payment),
+        ],
         states={
             PAYMENT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_payment_name)],
             PAYMENT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_payment_amount)],
@@ -357,20 +470,90 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     ))
 
+    # Khata Lookup Flow
     app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("khata", start_khata_lookup), MessageHandler(filters.Regex("^🔍 Customer Khata$"), start_khata_lookup)],
-        states={KHATA_SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, perform_khata_lookup)]},
+        entry_points=[
+            CommandHandler("khata", start_khata_lookup),
+            MessageHandler(filters.Regex("^🔍 Customer Khata$"), start_khata_lookup),
+        ],
+        states={
+            KHATA_SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, perform_khata_lookup)],
+        },
         fallbacks=[CommandHandler("cancel", cancel)],
     ))
 
+    # EOD Flow
     app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("eod", start_eod_flow), CallbackQueryHandler(start_eod_flow, pattern="^start_eod$"), MessageHandler(filters.Regex("^🏁 End of Day$"), start_eod_flow)],
-        states={EOD_PROFIT_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_profit_input)]},
+        entry_points=[
+            CommandHandler("eod", start_eod_flow),
+            CallbackQueryHandler(start_eod_flow, pattern="^start_eod$"),
+            MessageHandler(filters.Regex("^🏁 End of Day$"), start_eod_flow),
+        ],
+        states={
+            EOD_PROFIT_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_profit_input)],
+        },
         fallbacks=[CommandHandler("cancel", cancel)],
         per_message=False,
     ))
 
-    print("🚀 Shop Bot (Modular Architecture) is LIVE.")
+    # ================= INVENTORY HANDLERS =================
+    app.add_handler(MessageHandler(filters.Regex("^📦 Stock / Inventory$"), inventory_main_menu))
+    app.add_handler(CallbackQueryHandler(inventory_main_menu, pattern="^cat_back_main$"))
+    app.add_handler(CallbackQueryHandler(category_detail_menu, pattern="^cat_view_"))
+    app.add_handler(CallbackQueryHandler(list_items_in_category, pattern="^item_list_"))
+    app.add_handler(CallbackQueryHandler(handle_qty_change, pattern="^qty_(add|sub)_"))
+    app.add_handler(CallbackQueryHandler(handle_item_delete, pattern="^item_del_"))
+
+    # Add Category Conversation
+    app.add_handler(ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_add_category, pattern="^cat_add_new$")],
+        states={
+            ADD_CAT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_category_name)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_inv)],
+        per_message=False,
+    ))
+
+    # Add Item Conversation
+    app.add_handler(ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_add_item, pattern="^item_add_")],
+        states={
+            ITEM_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_item_name)],
+            ITEM_QTY: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_item_qty)],
+            ITEM_COST: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_item_cost)],
+            ITEM_SELL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_item_sell)],
+            ITEM_WARRANTY: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_item_warranty)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_inv)],
+        per_message=False,
+    ))
+
+    # Edit Item Conversation
+    app.add_handler(ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_item_edit, pattern="^item_edit_")],
+        states={
+            EDIT_SELECT_FIELD: [CallbackQueryHandler(select_edit_field, pattern="^edfield_")],
+            EDIT_NEW_VAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_edit_val)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_inv)],
+        per_message=False,
+    ))
+
+    # ================= DAILY SCHEDULER JOBS =================
+    if app.job_queue:
+        # 8:00 AM Daily Restock Alert
+        app.job_queue.run_daily(
+            send_8am_restock_alert,
+            time=datetime.time(hour=8, minute=0, second=0, tzinfo=TIMEZONE),
+        )
+        # 9:00 PM Closing Reminder
+        app.job_queue.run_daily(
+            send_9pm_reminder,
+            time=datetime.time(hour=21, minute=0, second=0, tzinfo=TIMEZONE),
+        )
+        print("⏰ 8:00 AM restock and 9:00 PM EOD reminder scheduled.")
+
+    print("🚀 Shop Automation Bot (Modular Architecture) is LIVE.")
     app.run_polling()
 
 if __name__ == "__main__":
