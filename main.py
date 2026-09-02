@@ -1,8 +1,9 @@
 import os
 import socket
+import sqlite3
+import csv
 import datetime
-from zoneinfo import  ZoneInfo
-import requests
+from zoneinfo import ZoneInfo
 import warnings
 from telegram.warnings import PTBUserWarning
 
@@ -29,39 +30,209 @@ from telegram.ext import (
 # ================= CONFIGURATION =================
 BOT_TOKEN = "8870922523:AAE_AwnI-AQJPwIS6woHI0r_D7yYm6HW6zQ"
 ADMIN_CHAT_ID = 6960228144
-PRINTER_IP = "192.168.1.100"  # LAN Thermal Printer IP
+PRINTER_IP = "192.168.1.100"  # Bench Thermal Printer LAN IP
 PRINTER_PORT = 9100
 TIMEZONE = ZoneInfo("Asia/Kolkata")
 IMAGE_DIR = "repair_images"
-
-WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbyJN01LaPle_BZx1T1P7y6zyHqLfUDagH0wpm_mGgjm1Dko69fiwh9qZPO1zVMQyfzT5Q/exec"
+DB_FILE = "shop.db"
 
 os.makedirs(IMAGE_DIR, exist_ok=True)
 
-# ================= MAIN DASHBOARD KEYBOARD =================
-# ================= MAIN DASHBOARD KEYBOARD =================
+# ================= LOCAL SQLITE BACKEND =================
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    # Repair table with autoincrement ID
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS repairs (
+            job_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT,
+            name TEXT,
+            model TEXT,
+            fault TEXT,
+            cost REAL,
+            charged REAL,
+            lock_code TEXT,
+            imei TEXT,
+            image TEXT,
+            status TEXT DEFAULT 'Pending',
+            profit REAL
+        )
+    """)
+    # Customer Ledger / Udhar table
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS ledger (
+            entry_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT,
+            name TEXT,
+            entry_type TEXT,
+            amount REAL,
+            note TEXT
+        )
+    """)
+    # Ensure Job IDs start at 1001 for professional token numbering
+    c.execute("SELECT count(*) FROM repairs")
+    if c.fetchone()[0] == 0:
+        c.execute("INSERT INTO sqlite_sequence (name, seq) VALUES ('repairs', 1000)")
+
+    conn.commit()
+    conn.close()
+
+def db_add_repair(data):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    profit = float(data.get("charged", 0)) - float(data.get("cost", 0))
+    c.execute("""
+        INSERT INTO repairs (date, name, model, fault, cost, charged, lock_code, imei, image, status, profit)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending', ?)
+    """, (
+        data["date"], data["name"], data["model"], data["fault"],
+        data["cost"], data["charged"], data.get("lock_code", "None"),
+        data.get("imei", "N/A"), data.get("image", "No Image"), profit
+    ))
+    job_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return {"status": "success", "job_id": job_id, "profit": profit}
+
+def db_find_job(job_id):
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT job_id, date, name, model, fault, cost, charged, imei, lock_code, status, profit FROM repairs WHERE job_id = ?", (int(job_id),))
+        row = c.fetchone()
+        conn.close()
+        if not row:
+            return {"status": "not_found"}
+        return {
+            "status": "success",
+            "job_id": row[0],
+            "date": row[1],
+            "name": row[2],
+            "customer": row[2],
+            "model": row[3],
+            "fault": row[4],
+            "cost": row[5],
+            "charged": row[6],
+            "imei": row[7],
+            "lock_code": row[8],
+            "job_status": row[9],
+            "profit": row[10]
+        }
+    except Exception:
+        return {"status": "not_found"}
+
+def db_update_status(job_id, new_status):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("UPDATE repairs SET status = ? WHERE job_id = ?", (new_status, int(job_id)))
+    conn.commit()
+    conn.close()
+    return {"status": "success"}
+
+def db_get_today_jobs(date_str):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT job_id, name, model, fault, cost, charged, profit FROM repairs WHERE date = ?", (date_str,))
+    rows = c.fetchall()
+    conn.close()
+    jobs = []
+    for r in rows:
+        jobs.append({
+            "job_id": r[0],
+            "customer": r[1],
+            "model": r[2],
+            "fault": r[3],
+            "cost": r[4],
+            "charged": r[5],
+            "auto_profit": r[6]
+        })
+    return {"status": "success", "jobs": jobs}
+
+def db_update_profit(job_id, profit):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("UPDATE repairs SET profit = ? WHERE job_id = ?", (float(profit), int(job_id)))
+    conn.commit()
+    conn.close()
+    return {"status": "success"}
+
+def db_add_ledger(date_str, name, entry_type, amount, note):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO ledger (date, name, entry_type, amount, note)
+        VALUES (?, ?, ?, ?, ?)
+    """, (date_str, name.strip(), entry_type, float(amount), note))
+    entry_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return {"status": "success", "entry_id": entry_id}
+
+def db_get_customer_balance(name):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        SELECT date, entry_type, amount, note 
+        FROM ledger 
+        WHERE LOWER(name) = LOWER(?)
+        ORDER BY entry_id ASC
+    """, (name.strip(),))
+    rows = c.fetchall()
+    conn.close()
+
+    total_debit = 0.0
+    total_credit = 0.0
+    history = []
+    for r in rows:
+        e_type, amt = r[1], float(r[2])
+        if e_type == "Debit":
+            total_debit += amt
+        elif e_type == "Credit":
+            total_credit += amt
+        history.append({"date": r[0], "type": e_type, "amount": amt, "note": r[3]})
+
+    return {
+        "status": "success",
+        "customer": name,
+        "total_debit": total_debit,
+        "total_credit": total_credit,
+        "balance": total_debit - total_credit,
+        "history": history[-5:]
+    }
+
+# ================= KEYBOARDS & STATES =================
 MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["➕ New Repair", "🏁 End of Day"],
-        ["🔍 Check Status", "🖨️ Reprint Token"],
+        ["📒 Udhar / Due", "💵 Receive Payment"],
+        ["🔍 Customer Khata", "🖨️ Reprint Token"],
+        ["📊 Check Status", "📥 Export Backup"],
     ],
     resize_keyboard=True,
     is_persistent=True,
 )
 
-# ================= CONVERSATION STATES =================
-NAME, MODEL, FAULT, REPAIR_DATE, COST_PRICE, CHARGED_PRICE, IMEI, LOCK_CODE, PHOTO = range(9)
-EOD_PROFIT_INPUT = 1
-
-
-# ================= HELPER API =================
-def call_sheet(payload):
-    try:
-        r = requests.post(WEBHOOK_URL, json=payload, timeout=12)
-        return r.json()
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
+# Conversation States
+(
+    NAME,
+    MODEL,
+    FAULT,
+    REPAIR_DATE,
+    COST_PRICE,
+    CHARGED_PRICE,
+    LOCK_CODE,
+    IMEI,
+    PHOTO,
+    EOD_PROFIT_INPUT,
+    LEDGER_NAME,
+    LEDGER_AMOUNT,
+    LEDGER_NOTE,
+    PAYMENT_NAME,
+    PAYMENT_AMOUNT,
+    PAYMENT_NOTE,
+    KHATA_SEARCH,
+) = range(17)
 
 # ================= SECURITY DECORATOR =================
 def admin_only(func):
@@ -71,11 +242,9 @@ def admin_only(func):
             await update.effective_message.reply_text("⛔ Unauthorized access.")
             return ConversationHandler.END
         return await func(update, context, *args, **kwargs)
-
     return wrapper
 
-
-# ================= NATIVE SOCKET THERMAL PRINTING =================
+# ================= ESC/POS PRINTING =================
 def send_escpos_raw(commands: bytes):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(5)
@@ -83,16 +252,12 @@ def send_escpos_raw(commands: bytes):
     s.sendall(commands)
     s.close()
 
-
 def print_repair_token(data, job_id):
     try:
         raw = bytearray()
-        raw += b"\x1b\x40"
-        raw += b"\x1b\x61\x01\x1d\x21\x11\x1b\x45\x01"
-        raw += b"SAMEER MOBILE\n"
-        raw += b"\x1d\x21\x00\x1b\x45\x00"
-        raw += b"Mobile Repair & Solutions\n--------------------------------\n"
-        raw += b"\x1d\x21\x01\x1b\x45\x01"
+        raw += b"\x1b\x40\x1b\x61\x01\x1d\x21\x11\x1b\x45\x01"
+        raw += b"SAMEER MOBILE\n\x1d\x21\x00\x1b\x45\x00"
+        raw += b"Mobile Repair & Solutions\n--------------------------------\n\x1d\x21\x01\x1b\x45\x01"
         raw += f"TOKEN: #{job_id}\n".encode("utf-8")
         raw += b"\x1d\x21\x00\x1b\x45\x00--------------------------------\n\x1b\x61\x00"
         raw += f"Date:     {data['date']}\n".encode("utf-8")
@@ -114,7 +279,6 @@ def print_repair_token(data, job_id):
     except Exception as e:
         return False, str(e)
 
-
 def print_eod_report(today_str, total_jobs, total_cost, total_charged, total_profit):
     try:
         raw = bytearray()
@@ -123,55 +287,43 @@ def print_eod_report(today_str, total_jobs, total_cost, total_charged, total_pro
         raw += f"Date: {today_str}\n--------------------------------\n\x1b\x61\x00".encode("utf-8")
         raw += f"Total Jobs Done:  {total_jobs}\n".encode("utf-8")
         raw += f"Total Cost:       Rs. {total_cost:.2f}\n".encode("utf-8")
-        raw += f"Total Revenue:    Rs. {total_charged:.2f}\n--------------------------------\n\x1b\x45\x01".encode(
-            "utf-8")
-        raw += f"NET PROFIT:       Rs. {total_profit:.2f}\n\x1b\x45\x00--------------------------------\n\n\n\n\x1d\x56\x41\x10".encode(
-            "utf-8")
+        raw += f"Total Revenue:    Rs. {total_charged:.2f}\n--------------------------------\n\x1b\x45\x01".encode("utf-8")
+        raw += f"NET PROFIT:       Rs. {total_profit:.2f}\n\x1b\x45\x00--------------------------------\n\n\n\n\x1d\x56\x41\x10".encode("utf-8")
         send_escpos_raw(bytes(raw))
         return True
     except Exception as e:
         print(f"EOD Print Error: {e}")
         return False
 
-
-# ================= START / MENU =================
+# ================= CORE BOT COMMANDS =================
 @admin_only
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome_text = (
-        "🛠 *SAMEER MOBILE - Control Panel*\n\n"
-        "Tap a button below to get started 👇"
-    )
+    welcome_text = "🛠 *SAMEER MOBILE - Control Panel*\n\nTap a button below to manage repairs and accounts 👇"
     await update.message.reply_markdown(welcome_text, reply_markup=MAIN_MENU_KEYBOARD)
-
 
 async def handle_menu_shortcuts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
-    if text == "🔍 Check Status":
+    if text == "📊 Check Status":
         await update.message.reply_text("Send: `/status [JobID]` (e.g., `/status 1001`)", parse_mode="Markdown")
     elif text == "🖨️ Reprint Token":
         await update.message.reply_text("Send: `/reprint [JobID]` (e.g., `/reprint 1001`)", parse_mode="Markdown")
 
-
-# ================= NEW REPAIR FLOW =================
+# ================= NEW REPAIR CONVERSATION =================
 @admin_only
 async def start_new_repair(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("📝 *New Repair*\n\n1️⃣ Enter *Customer Name*:", parse_mode="Markdown",
-                                    reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text("📝 *New Repair*\n\n1️⃣ Enter *Customer Name*:", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
     return NAME
-
 
 async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["name"] = update.message.text.strip()
     await update.message.reply_text("2️⃣ Enter *Device Model*:", parse_mode="Markdown")
     return MODEL
 
-
 async def get_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["model"] = update.message.text.strip()
     await update.message.reply_text("3️⃣ Describe the *Fault / Issue*:", parse_mode="Markdown")
     return FAULT
-
 
 async def get_fault(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["fault"] = update.message.text.strip()
@@ -183,14 +335,11 @@ async def get_fault(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return REPAIR_DATE
 
-
 async def get_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     inp = update.message.text.strip()
     context.user_data["date"] = datetime.date.today().strftime("%Y-%m-%d") if inp.lower() == "today" else inp
-    await update.message.reply_text("5️⃣ Enter *Part / Repair Cost* (₹):", reply_markup=ReplyKeyboardRemove(),
-                                    parse_mode="Markdown")
+    await update.message.reply_text("5️⃣ Enter *Part / Repair Cost* (₹):", reply_markup=ReplyKeyboardRemove(), parse_mode="Markdown")
     return COST_PRICE
-
 
 async def get_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -201,7 +350,6 @@ async def get_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("6️⃣ Enter *Price Charged to Customer* (₹):", parse_mode="Markdown")
     return CHARGED_PRICE
 
-
 async def get_charged(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         context.user_data["charged"] = float(update.message.text.strip())
@@ -211,18 +359,15 @@ async def get_charged(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     reply_keyboard = [["No Lock / Skip"]]
     await update.message.reply_text(
-        "7️⃣ Enter *PIN / Pattern Lock*:\n"
-        "*(For Pattern, enter dot numbers 1-9, e.g., `12359` or tap No Lock)*",
+        "7️⃣ Enter *PIN / Pattern Lock*:\n*(For Pattern, enter dot numbers 1-9, e.g., `12359` or tap No Lock)*",
         reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True, resize_keyboard=True),
         parse_mode="Markdown",
     )
     return LOCK_CODE
 
-
 async def get_lock_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     inp = update.message.text.strip()
     context.user_data["lock_code"] = "None" if "no lock" in inp.lower() or "skip" in inp.lower() else inp
-
     reply_keyboard = [["Skip IMEI"]]
     await update.message.reply_text(
         "8️⃣ Enter *IMEI* (or tap Skip):",
@@ -230,7 +375,6 @@ async def get_lock_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
     return IMEI
-
 
 async def get_imei(update: Update, context: ContextTypes.DEFAULT_TYPE):
     inp = update.message.text.strip()
@@ -243,26 +387,21 @@ async def get_imei(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return PHOTO
 
-
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo_file = await update.message.photo[-1].get_file()
-    fname = f"{context.user_data.get('model', 'device')}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg".replace(
-        " ", "_")
+    fname = f"{context.user_data.get('model', 'device')}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg".replace(" ", "_")
     fpath = os.path.join(IMAGE_DIR, fname)
     await photo_file.download_to_drive(fpath)
     context.user_data["image_status"] = fname
     return await save_repair_entry(update, context)
 
-
 async def skip_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["image_status"] = "No Image"
     return await save_repair_entry(update, context)
 
-
 async def save_repair_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = context.user_data
     payload = {
-        "action": "add_repair",
         "date": data["date"],
         "name": data["name"],
         "model": data["model"],
@@ -273,29 +412,23 @@ async def save_repair_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "imei": data.get("imei", "N/A"),
         "image": data.get("image_status", "No Image"),
     }
-    res = call_sheet(payload)
+    res = db_add_repair(payload)
+    job_id = res["job_id"]
+    printed, p_stat = print_repair_token(data, job_id)
+    p_badge = "🖨️ *Token Printed!*" if printed else f"⚠️ *Print Error:* `{p_stat}`"
 
-    if res.get("status") == "success":
-        job_id = res["job_id"]
-        printed, p_stat = print_repair_token(data, job_id)
-        p_badge = "🖨️ *Token Printed!*" if printed else f"⚠️ *Print Error:* `{p_stat}`"
-
-        summary = (
-            f"✅ *Repair Saved to Google Sheet!*\n\n"
-            f"🏷 *Token:* `#{job_id}`\n"
-            f"👤 *Customer:* {data['name']}\n"
-            f"📱 *Model:* {data['model']}\n"
-            f"🔧 *Fault:* {data['fault']}\n"
-            f"🔐 *Lock / PIN:* `{data.get('lock_code', 'None')}`\n"
-            f"💰 *Charged:* ₹{data['charged']:.2f}\n"
-            f"{p_badge}"
-        )
-    else:
-        summary = f"⚠️ *Error saving to sheet:* {res.get('message', 'Unknown error')}"
-
+    summary = (
+        f"✅ *Repair Saved (SQLite Database)*\n\n"
+        f"🏷 *Token:* `#{job_id}`\n"
+        f"👤 *Customer:* {data['name']}\n"
+        f"📱 *Model:* {data['model']}\n"
+        f"🔧 *Fault:* {data['fault']}\n"
+        f"🔐 *Lock / PIN:* `{data.get('lock_code', 'None')}`\n"
+        f"💰 *Charged:* ₹{data['charged']:.2f}\n"
+        f"{p_badge}"
+    )
     await update.message.reply_markdown(summary, reply_markup=MAIN_MENU_KEYBOARD)
     return ConversationHandler.END
-
 
 # ================= REPRINT & STATUS =================
 @admin_only
@@ -304,13 +437,12 @@ async def reprint_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: `/reprint 1001`", parse_mode="Markdown")
         return
     job_id = context.args[0].strip()
-    res = call_sheet({"action": "find_job", "job_id": job_id})
+    res = db_find_job(job_id)
     if res.get("status") != "success":
         await update.message.reply_text(f"❌ Job `#{job_id}` not found.")
         return
     printed, stat = print_repair_token(res, job_id)
     await update.message.reply_text(f"🖨️ Reprint #{job_id}: {stat}", reply_markup=MAIN_MENU_KEYBOARD)
-
 
 @admin_only
 async def check_or_update_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -318,34 +450,32 @@ async def check_or_update_status(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("Usage: `/status 1001`", parse_mode="Markdown")
         return
     job_id = context.args[0].strip()
-    res = call_sheet({"action": "find_job", "job_id": job_id})
+    res = db_find_job(job_id)
     if res.get("status") != "success":
         await update.message.reply_text(f"❌ Job `#{job_id}` not found.")
         return
-    row_num = res["row_index"]
+
     keyboard = [
         [
-            InlineKeyboardButton("⏳ In Progress", callback_data=f"st_{job_id}_{row_num}_In Progress"),
-            InlineKeyboardButton("✅ Completed", callback_data=f"st_{job_id}_{row_num}_Completed"),
+            InlineKeyboardButton("⏳ In Progress", callback_data=f"st_{job_id}_In Progress"),
+            InlineKeyboardButton("✅ Completed", callback_data=f"st_{job_id}_Completed"),
         ],
         [
-            InlineKeyboardButton("📦 Delivered", callback_data=f"st_{job_id}_{row_num}_Delivered"),
-            InlineKeyboardButton("❌ Returned", callback_data=f"st_{job_id}_{row_num}_Returned"),
+            InlineKeyboardButton("📦 Delivered", callback_data=f"st_{job_id}_Delivered"),
+            InlineKeyboardButton("❌ Returned", callback_data=f"st_{job_id}_Returned"),
         ],
     ]
     await update.message.reply_markdown(
-        f"📱 *Job #{job_id}* ({res['model']})\n🔐 Lock: `{res.get('lock_code', 'None')}`\nStatus: `{res['job_status']}`\nSelect new status:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        f"📱 *Job #{job_id}* ({res['model']})\n👤 Customer: {res['name']}\n🔐 Lock: `{res.get('lock_code', 'None')}`\nStatus: `{res['job_status']}`\nSelect new status:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
-
 
 async def handle_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    _, job_id, row_num, new_status = query.data.split("_", 3)
-    call_sheet({"action": "update_cell", "row_index": int(row_num), "col_index": 11, "value": new_status})
+    _, job_id, new_status = query.data.split("_", 2)
+    db_update_status(job_id, new_status)
     await query.edit_message_text(f"✅ Job `#{job_id}` updated to *{new_status}*.", parse_mode="Markdown")
-
 
 # ================= SEQUENTIAL EOD PROFIT FLOW =================
 @admin_only
@@ -355,7 +485,7 @@ async def start_eod_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.answer()
 
     today_str = datetime.date.today().strftime("%Y-%m-%d")
-    res = call_sheet({"action": "get_today_jobs", "date": today_str})
+    res = db_get_today_jobs(today_str)
     today_jobs = res.get("jobs", [])
 
     if not today_jobs:
@@ -369,7 +499,6 @@ async def start_eod_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await target.reply_text(f"📋 *Starting EOD Review for {today_str}* ({len(today_jobs)} jobs):", parse_mode="Markdown")
     return await prompt_next_job(update, context)
-
 
 async def prompt_next_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
     jobs = context.user_data["eod_jobs"]
@@ -385,10 +514,12 @@ async def prompt_next_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👉 Enter actual profit (or tap button):"
     )
     target = update.callback_query.message if update.callback_query else update.message
-    await target.reply_text(text, reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True,
-                                                                   resize_keyboard=True), parse_mode="Markdown")
+    await target.reply_text(
+        text,
+        reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True, resize_keyboard=True),
+        parse_mode="Markdown",
+    )
     return EOD_PROFIT_INPUT
-
 
 async def handle_profit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     jobs = context.user_data["eod_jobs"]
@@ -400,8 +531,7 @@ async def handle_profit_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     j["final_profit"] = val
     context.user_data["entered_profits"].append(j)
 
-    # Column 12 in the new sheet structure corresponds to Profit
-    call_sheet({"action": "update_cell", "row_index": j["row_index"], "col_index": 12, "value": val})
+    db_update_profit(j["job_id"], val)
     context.user_data["current_index"] += 1
 
     if context.user_data["current_index"] < len(jobs):
@@ -428,6 +558,119 @@ async def handle_profit_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data.clear()
     return ConversationHandler.END
 
+# ================= LEDGER (UDHAR & JAMA) FLOWS =================
+@admin_only
+async def start_udhar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("📒 *Add Udhar (Customer Due)*\n\nEnter *Customer Name*:", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
+    return LEDGER_NAME
+
+async def get_udhar_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["l_name"] = update.message.text.strip()
+    await update.message.reply_text("Enter *Due Amount* (₹):", parse_mode="Markdown")
+    return LEDGER_AMOUNT
+
+async def get_udhar_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        context.user_data["l_amount"] = float(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("⚠️ Enter a valid numeric amount:")
+        return LEDGER_AMOUNT
+    await update.message.reply_text("Enter *Reason / Device / Job ID* (or type 'None'):", parse_mode="Markdown")
+    return LEDGER_NOTE
+
+async def save_udhar_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    note = update.message.text.strip()
+    today_str = datetime.date.today().strftime("%Y-%m-%d")
+    name = context.user_data["l_name"]
+    amount = context.user_data["l_amount"]
+
+    db_add_ledger(today_str, name, "Debit", amount, note)
+    msg = f"✅ *Udhar Recorded!*\n\n👤 Customer: *{name}*\n💰 Amount Due: *₹{amount:.2f}*\n📝 Note: {note}"
+    await update.message.reply_markdown(msg, reply_markup=MAIN_MENU_KEYBOARD)
+    context.user_data.clear()
+    return ConversationHandler.END
+
+@admin_only
+async def start_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("💵 *Receive Payment (Jama Entry)*\n\nEnter *Customer Name*:", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
+    return PAYMENT_NAME
+
+async def get_payment_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["p_name"] = update.message.text.strip()
+    await update.message.reply_text("Enter *Amount Received* (₹):", parse_mode="Markdown")
+    return PAYMENT_AMOUNT
+
+async def get_payment_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        context.user_data["p_amount"] = float(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("⚠️ Enter a valid numeric amount:")
+        return PAYMENT_AMOUNT
+    await update.message.reply_text("Payment Mode / Note (e.g., Cash, GPay, UPI):", parse_mode="Markdown")
+    return PAYMENT_NOTE
+
+async def save_payment_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    note = update.message.text.strip()
+    today_str = datetime.date.today().strftime("%Y-%m-%d")
+    name = context.user_data["p_name"]
+    amount = context.user_data["p_amount"]
+
+    db_add_ledger(today_str, name, "Credit", amount, note)
+    msg = f"✅ *Payment Logged!*\n\n👤 Customer: *{name}*\n💵 Received: *₹{amount:.2f}*\n📝 Note: {note}"
+    await update.message.reply_markdown(msg, reply_markup=MAIN_MENU_KEYBOARD)
+    context.user_data.clear()
+    return ConversationHandler.END
+
+@admin_only
+async def start_khata_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔍 Enter *Customer Name* to check pending balance:", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
+    return KHATA_SEARCH
+
+async def perform_khata_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = update.message.text.strip()
+    res = db_get_customer_balance(name)
+    bal = res["balance"]
+    history = res.get("history", [])
+
+    status_line = f"🔴 *Pending Due:* ₹{bal:,.2f}" if bal > 0 else f"🟢 *All Cleared / Advance:* ₹{abs(bal):,.2f}"
+    hist_text = ""
+    if history:
+        hist_text = "\n\n*Recent Transactions:*\n" + "\n".join(
+            [f"• `{h['date']}` | {h['type']}: ₹{h['amount']:.0f} ({h['note']})" for h in history]
+        )
+
+    summary = (
+        f"📒 *Customer Khata: {name}*\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"Total Udhar: ₹{res['total_debit']:,.2f}\n"
+        f"Total Paid:  ₹{res['total_credit']:,.2f}\n"
+        f"{status_line}"
+        f"{hist_text}"
+    )
+    await update.message.reply_markdown(summary, reply_markup=MAIN_MENU_KEYBOARD)
+    return ConversationHandler.END
+
+# ================= DATABASE EXPORT BACKUP =================
+@admin_only
+async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Exports SQLite repairs table to CSV and sends directly to Telegram."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT * FROM repairs")
+    rows = c.fetchall()
+    headers = [d[0] for d in c.description]
+    conn.close()
+
+    csv_path = "repairs_backup.csv"
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        writer.writerows(rows)
+
+    with open(csv_path, "rb") as f:
+        await update.message.reply_document(document=f, filename="repairs_backup.csv", caption="📊 Latest Repair Database Export")
 
 # ================= 9:00 PM REMINDER =================
 async def send_9pm_reminder(context: ContextTypes.DEFAULT_TYPE):
@@ -439,29 +682,33 @@ async def send_9pm_reminder(context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
-
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Cancelled.", reply_markup=MAIN_MENU_KEYBOARD)
     return ConversationHandler.END
 
-
-# ================= SET BOT COMMANDS =================
+# ================= MENU REGISTRATION =================
 async def post_init(application):
     commands = [
         BotCommand("start", "Open Main Menu"),
         BotCommand("newrepair", "Log a new repair job"),
+        BotCommand("udhar", "Log customer due amount"),
+        BotCommand("payment", "Log payment received"),
+        BotCommand("khata", "Check customer balance"),
         BotCommand("eod", "Start End of Day review"),
         BotCommand("status", "Check/Update job status"),
         BotCommand("reprint", "Reprint thermal receipt"),
+        BotCommand("export", "Export database CSV backup"),
     ]
     await application.bot.set_my_commands(commands)
 
-
 # ================= MAIN =================
 def main():
+    init_db()  # Automatically creates shop.db tables on start
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("export", export_data))
+    app.add_handler(MessageHandler(filters.Regex("^📥 Export Backup$"), export_data))
 
     # Repair Entry Conversation
     app.add_handler(ConversationHandler(
@@ -486,6 +733,46 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     ))
 
+    # Udhar Conversation
+    app.add_handler(ConversationHandler(
+        entry_points=[
+            CommandHandler("udhar", start_udhar),
+            MessageHandler(filters.Regex("^📒 Udhar / Due$"), start_udhar),
+        ],
+        states={
+            LEDGER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_udhar_name)],
+            LEDGER_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_udhar_amount)],
+            LEDGER_NOTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_udhar_entry)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    ))
+
+    # Payment Conversation
+    app.add_handler(ConversationHandler(
+        entry_points=[
+            CommandHandler("payment", start_payment),
+            MessageHandler(filters.Regex("^💵 Receive Payment$"), start_payment),
+        ],
+        states={
+            PAYMENT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_payment_name)],
+            PAYMENT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_payment_amount)],
+            PAYMENT_NOTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_payment_entry)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    ))
+
+    # Khata Lookup Conversation
+    app.add_handler(ConversationHandler(
+        entry_points=[
+            CommandHandler("khata", start_khata_lookup),
+            MessageHandler(filters.Regex("^🔍 Customer Khata$"), start_khata_lookup),
+        ],
+        states={
+            KHATA_SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, perform_khata_lookup)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    ))
+
     # EOD Review Conversation
     app.add_handler(ConversationHandler(
         entry_points=[
@@ -503,15 +790,14 @@ def main():
     app.add_handler(CommandHandler("reprint", reprint_token))
     app.add_handler(CommandHandler("status", check_or_update_status))
     app.add_handler(CallbackQueryHandler(handle_status_callback, pattern="^st_"))
-    app.add_handler(MessageHandler(filters.Regex("^(🔍 Check Status|🖨️ Reprint Token)$"), handle_menu_shortcuts))
+    app.add_handler(MessageHandler(filters.Regex("^(📊 Check Status|🖨️ Reprint Token)$"), handle_menu_shortcuts))
 
     if app.job_queue:
         app.job_queue.run_daily(send_9pm_reminder, time=datetime.time(hour=21, minute=0, second=0, tzinfo=TIMEZONE))
         print("⏰ 9:00 PM EOD reminder scheduled.")
 
-    print("🚀 Shop Automation Bot is LIVE.")
+    print("🚀 Shop Automation Bot (SQLite Native) is LIVE.")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
